@@ -1,14 +1,17 @@
-mod config;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod protocol;
 mod usb;
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use config::Config;
+use clap::Parser;
 use device_query::{DeviceQuery, DeviceState as DeviceQueryState};
 use log::{debug, error, info, warn};
 use protocol::{
@@ -22,6 +25,43 @@ use usb::LitraDevice;
 use std::sync::mpsc as std_mpsc;
 
 slint::include_modules!();
+
+#[derive(Parser)]
+#[command(name = "litra-glow", version, about = "Logitech Litra Glow controller")]
+struct Cli {
+    #[arg(long, help = "Turn the lamp on")]
+    on: bool,
+
+    #[arg(long, help = "Turn the lamp off")]
+    off: bool,
+
+    #[arg(long, help = "Toggle lamp power")]
+    toggle: bool,
+
+    #[arg(long, value_name = "0-100", help = "Set brightness (percentage)")]
+    brightness: Option<u8>,
+
+    #[arg(
+        long,
+        value_name = "KELVIN",
+        help = "Set color temperature (2700-6500)"
+    )]
+    temperature: Option<u16>,
+
+    #[arg(long, help = "Show current lamp status")]
+    status: bool,
+}
+
+impl Cli {
+    fn has_commands(&self) -> bool {
+        self.on
+            || self.off
+            || self.toggle
+            || self.brightness.is_some()
+            || self.temperature.is_some()
+            || self.status
+    }
+}
 
 #[derive(Debug)]
 enum DeviceCommand {
@@ -237,12 +277,153 @@ fn handle_tray_command(cmd: TrayCommand, app_weak: &slint::Weak<AppWindow>) {
     }
 }
 
-fn main() -> Result<(), slint::PlatformError> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    info!("Starting Litra Glow app");
+#[cfg(windows)]
+fn init_cli_console() {
+    if std::env::args_os().nth(1).is_none() {
+        return;
+    }
 
-    let config = Rc::new(RefCell::new(Config::load()));
-    let cfg = config.borrow();
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn SetStdHandle(n_std_handle: u32, handle: isize) -> i32;
+    }
+
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+
+    unsafe {
+        let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let stderr_handle = GetStdHandle(STD_ERROR_HANDLE);
+        let stdout_invalid = stdout_handle == 0 || stdout_handle == INVALID_HANDLE_VALUE;
+        let stderr_invalid = stderr_handle == 0 || stderr_handle == INVALID_HANDLE_VALUE;
+
+        if stdout_invalid || stderr_invalid {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+
+        if stdout_invalid {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                let handle = file.as_raw_handle() as isize;
+                let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+                std::mem::forget(file);
+            }
+        }
+
+        if stderr_invalid {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                let handle = file.as_raw_handle() as isize;
+                let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
+                std::mem::forget(file);
+            }
+        }
+    }
+}
+
+fn run_headless(cli: Cli) -> Result<(), String> {
+    let device = LitraDevice::open().map_err(|e| format!("Failed to open device: {}", e))?;
+
+    if cli.status {
+        device.send(Command::GetPower).map_err(|e| e.to_string())?;
+        thread::sleep(Duration::from_millis(100));
+        device
+            .send(Command::GetBrightness)
+            .map_err(|e| e.to_string())?;
+        thread::sleep(Duration::from_millis(100));
+        device
+            .send(Command::GetTemperature)
+            .map_err(|e| e.to_string())?;
+
+        let mut power = None;
+        let mut brightness = None;
+        let mut temperature = None;
+
+        for _ in 0..10 {
+            thread::sleep(Duration::from_millis(50));
+            while let Ok(Some(response)) = device.try_read() {
+                match response {
+                    Response::Power(on, _) => power = Some(on),
+                    Response::Brightness(level, _) => brightness = Some(level),
+                    Response::Temperature(temp, _) => temperature = Some(temp),
+                }
+            }
+            if power.is_some() && brightness.is_some() && temperature.is_some() {
+                break;
+            }
+        }
+
+        let brightness_pct =
+            brightness.map(|b| ((b - MIN_BRIGHTNESS) * 100) / (MAX_BRIGHTNESS - MIN_BRIGHTNESS));
+
+        fn fmt_opt<T: std::fmt::Display>(opt: Option<T>) -> String {
+            opt.map_or("null".to_string(), |v| v.to_string())
+        }
+        println!(
+            "{{\"power\":{},\"brightness\":{},\"temperature\":{}}}",
+            fmt_opt(power),
+            fmt_opt(brightness_pct),
+            fmt_opt(temperature)
+        );
+
+        return Ok(());
+    }
+
+    if cli.toggle {
+        device.send(Command::GetPower).map_err(|e| e.to_string())?;
+        thread::sleep(Duration::from_millis(100));
+        if let Ok(Some(Response::Power(on, _))) = device.try_read() {
+            device
+                .send(Command::SetPower(!on))
+                .map_err(|e| e.to_string())?;
+        }
+    } else if cli.on {
+        device
+            .send(Command::SetPower(true))
+            .map_err(|e| e.to_string())?;
+    } else if cli.off {
+        device
+            .send(Command::SetPower(false))
+            .map_err(|e| e.to_string())?;
+    }
+
+    if let Some(percent) = cli.brightness {
+        let level = (percent as u16).clamp(0, 100);
+        let brightness = MIN_BRIGHTNESS + (level * (MAX_BRIGHTNESS - MIN_BRIGHTNESS) / 100);
+        device
+            .send(Command::SetBrightness(brightness))
+            .map_err(|e| e.to_string())?;
+    }
+
+    if let Some(temp) = cli.temperature {
+        let temp = temp.clamp(MIN_TEMPERATURE, MAX_TEMPERATURE);
+        device
+            .send(Command::SetTemperature(temp))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn main() -> Result<(), slint::PlatformError> {
+    #[cfg(windows)]
+    init_cli_console();
+
+    let cli = Cli::parse();
+
+    if cli.has_commands() {
+        if let Err(e) = run_headless(cli) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    info!("Starting Litra Glow app");
 
     let app = AppWindow::new()?;
     info!("App window created");
@@ -253,9 +434,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let initialized = Rc::new(Cell::new(false));
 
-    app.set_brightness(cfg.brightness as f32);
-    app.set_temperature(cfg.temperature as f32);
-    app.set_power(cfg.power);
+    app.set_brightness(MIN_BRIGHTNESS as f32);
+    app.set_temperature(MIN_TEMPERATURE as f32);
+    app.set_power(false);
     app.set_error("Connecting...".into());
 
     #[cfg(feature = "tray")]
@@ -269,39 +450,25 @@ fn main() -> Result<(), slint::PlatformError> {
     let (evt_tx, evt_rx) = mpsc::channel();
 
     let device_state = DeviceState {
-        power: cfg.power,
-        brightness: cfg.brightness,
-        temperature: cfg.temperature,
+        power: false,
+        brightness: MIN_BRIGHTNESS,
+        temperature: MIN_TEMPERATURE,
         pending_brightness: None,
         pending_temperature: None,
     };
-    drop(cfg);
     thread::spawn(move || device_loop(cmd_rx, evt_tx, device_state));
 
-    let config_brightness = Rc::clone(&config);
     let initialized_brightness = Rc::clone(&initialized);
     let cmd_tx_brightness = cmd_tx.clone();
     app.on_brightness_changed(move |value| {
-        info!(
-            "Brightness callback: value={}, initialized={}",
-            value,
-            initialized_brightness.get()
-        );
         if !initialized_brightness.get() {
             return;
         }
         let level = clamp_brightness(value);
         info!("Brightness changed: {} -> {}", value, level);
-        if let Ok(mut cfg) = config_brightness.try_borrow_mut()
-            && cfg.brightness != level
-        {
-            cfg.brightness = level;
-            cfg.save();
-        }
         let _ = cmd_tx_brightness.send(DeviceCommand::SetBrightness(level));
     });
 
-    let config_temperature = Rc::clone(&config);
     let initialized_temperature = Rc::clone(&initialized);
     let cmd_tx_temperature = cmd_tx.clone();
     app.on_temperature_changed(move |value| {
@@ -310,34 +477,16 @@ fn main() -> Result<(), slint::PlatformError> {
         }
         let level = clamp_temperature(value);
         info!("Temperature changed: {} -> {}", value, level);
-        if let Ok(mut cfg) = config_temperature.try_borrow_mut()
-            && cfg.temperature != level
-        {
-            cfg.temperature = level;
-            cfg.save();
-        }
         let _ = cmd_tx_temperature.send(DeviceCommand::SetTemperature(level));
     });
 
-    let config_power = Rc::clone(&config);
     let initialized_power = Rc::clone(&initialized);
     let cmd_tx_power = cmd_tx.clone();
     app.on_power_toggled(move |on| {
-        info!(
-            "Power callback: on={}, initialized={}",
-            on,
-            initialized_power.get()
-        );
         if !initialized_power.get() {
             return;
         }
         info!("Power toggled: {}", on);
-        if let Ok(mut cfg) = config_power.try_borrow_mut()
-            && cfg.power != on
-        {
-            cfg.power = on;
-            cfg.save();
-        }
         let _ = cmd_tx_power.send(DeviceCommand::SetPower(on));
     });
 
@@ -378,7 +527,6 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let app_weak_events = app.as_weak();
-    let config_events = Rc::clone(&config);
     let initialized_events = Rc::clone(&initialized);
     let init_count = Rc::new(Cell::new(0u8));
     let timer = slint::Timer::default();
@@ -405,30 +553,18 @@ fn main() -> Result<(), slint::PlatformError> {
                     DeviceEvent::Power(on) => {
                         info!("UI received power event: {}", on);
                         app.set_power(on);
-                        if let Ok(mut cfg) = config_events.try_borrow_mut() {
-                            cfg.power = on;
-                            cfg.save();
-                        }
                         if !initialized_events.get() {
                             init_count.set(init_count.get() + 1);
                         }
                     }
                     DeviceEvent::Brightness(level) => {
                         app.set_brightness(level as f32);
-                        if let Ok(mut cfg) = config_events.try_borrow_mut() {
-                            cfg.brightness = level;
-                            cfg.save();
-                        }
                         if !initialized_events.get() {
                             init_count.set(init_count.get() + 1);
                         }
                     }
                     DeviceEvent::Temperature(level) => {
                         app.set_temperature(level as f32);
-                        if let Ok(mut cfg) = config_events.try_borrow_mut() {
-                            cfg.temperature = level;
-                            cfg.save();
-                        }
                         if !initialized_events.get() {
                             init_count.set(init_count.get() + 1);
                         }
