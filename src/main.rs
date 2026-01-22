@@ -305,20 +305,18 @@ fn init_cli_console() {
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
 
-        if stdout_invalid {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-                let handle = file.as_raw_handle() as isize;
-                let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
-                std::mem::forget(file);
-            }
+        if stdout_invalid && let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$")
+        {
+            let handle = file.as_raw_handle() as isize;
+            let _ = SetStdHandle(STD_OUTPUT_HANDLE, handle);
+            std::mem::forget(file);
         }
 
-        if stderr_invalid {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-                let handle = file.as_raw_handle() as isize;
-                let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
-                std::mem::forget(file);
-            }
+        if stderr_invalid && let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$")
+        {
+            let handle = file.as_raw_handle() as isize;
+            let _ = SetStdHandle(STD_ERROR_HANDLE, handle);
+            std::mem::forget(file);
         }
     }
 }
