@@ -3,6 +3,8 @@ fn main() {
 
     #[cfg(windows)]
     if std::path::Path::new("assets/icon.ico").exists() {
-        embed_resource::compile("resources.rc", embed_resource::NONE);
+        embed_resource::compile("resources.rc", embed_resource::NONE)
+            .manifest_optional()
+            .expect("Failed to compile resources");
     }
 }

@@ -15,7 +15,7 @@ use protocol::{
     Command, MAX_BRIGHTNESS, MAX_TEMPERATURE, MIN_BRIGHTNESS, MIN_TEMPERATURE, Response,
     TEMPERATURE_STEP,
 };
-use slint::winit_030::{winit, WinitWindowAccessor};
+use slint::winit_030::{WinitWindowAccessor, winit};
 use usb::LitraDevice;
 
 #[cfg(feature = "tray")]
@@ -152,10 +152,7 @@ fn center_window_on_active_monitor(window: &winit::window::Window) -> bool {
     } else {
         y.clamp(monitor_position.y, max_y)
     };
-    window.set_outer_position(winit::dpi::PhysicalPosition::new(
-        clamped_x,
-        clamped_y,
-    ));
+    window.set_outer_position(winit::dpi::PhysicalPosition::new(clamped_x, clamped_y));
     true
 }
 
@@ -166,7 +163,7 @@ fn schedule_center_window(app_weak: slint::Weak<AppWindow>, attempts_left: u8) {
         };
         let did_center = app
             .window()
-            .with_winit_window(|w| center_window_on_active_monitor(w))
+            .with_winit_window(center_window_on_active_monitor)
             .unwrap_or(false);
         if !did_center && attempts_left > 0 {
             schedule_center_window(app_weak.clone(), attempts_left - 1);
@@ -181,7 +178,7 @@ enum TrayCommand {
 }
 
 #[cfg(feature = "tray")]
-fn setup_tray(app_weak: slint::Weak<AppWindow>) -> bool {
+fn setup_tray() -> Option<(tray_item::TrayItem, std_mpsc::Receiver<TrayCommand>)> {
     use tray_item::TrayItem;
 
     let tray_result = TrayItem::new("Litra Glow", tray_item::IconSource::Resource("tray-icon"));
@@ -192,7 +189,7 @@ fn setup_tray(app_weak: slint::Weak<AppWindow>) -> bool {
                 "Failed to create tray icon: {:?}. Tray functionality disabled.",
                 e
             );
-            return false;
+            return None;
         }
     };
 
@@ -205,7 +202,7 @@ fn setup_tray(app_weak: slint::Weak<AppWindow>) -> bool {
         })
         .is_err()
     {
-        return false;
+        return None;
     }
 
     if tray
@@ -214,39 +211,31 @@ fn setup_tray(app_weak: slint::Weak<AppWindow>) -> bool {
         })
         .is_err()
     {
-        return false;
+        return None;
     }
 
-    std::thread::spawn(move || {
-        let _tray = tray; // Keep tray alive
-        loop {
-            if let Ok(cmd) = rx.recv() {
-                let app_weak = app_weak.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(app) = app_weak.upgrade() {
-                        match cmd {
-                            TrayCommand::Show => {
-                                app.window().with_winit_window(|w| {
-                                    center_window_on_active_monitor(w);
-                                    w.set_visible(true);
-                                    w.focus_window();
-                                });
-                                schedule_center_window(app.as_weak(), CENTER_RETRY_LIMIT);
-                            }
-                            TrayCommand::Quit => {
-                                slint::quit_event_loop().ok();
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
     info!("Tray icon created successfully");
-    true
+    Some((tray, rx))
 }
 
+#[cfg(feature = "tray")]
+fn handle_tray_command(cmd: TrayCommand, app_weak: &slint::Weak<AppWindow>) {
+    if let Some(app) = app_weak.upgrade() {
+        match cmd {
+            TrayCommand::Show => {
+                app.window().with_winit_window(|w| {
+                    center_window_on_active_monitor(w);
+                    w.set_visible(true);
+                    w.focus_window();
+                });
+                schedule_center_window(app.as_weak(), CENTER_RETRY_LIMIT);
+            }
+            TrayCommand::Quit => {
+                slint::quit_event_loop().ok();
+            }
+        }
+    }
+}
 
 fn main() -> Result<(), slint::PlatformError> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -270,7 +259,9 @@ fn main() -> Result<(), slint::PlatformError> {
     app.set_error("Connecting...".into());
 
     #[cfg(feature = "tray")]
-    let tray_enabled = setup_tray(app.as_weak());
+    let tray_setup = setup_tray();
+    #[cfg(feature = "tray")]
+    let tray_enabled = tray_setup.is_some();
     #[cfg(not(feature = "tray"))]
     let tray_enabled = false;
 
@@ -398,6 +389,13 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(app) = app_weak_events.upgrade() else {
                 return;
             };
+
+            #[cfg(feature = "tray")]
+            if let Some((ref _tray, ref tray_rx)) = tray_setup {
+                while let Ok(cmd) = tray_rx.try_recv() {
+                    handle_tray_command(cmd, &app_weak_events);
+                }
+            }
 
             while let Ok(event) = evt_rx.try_recv() {
                 match event {
